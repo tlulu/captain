@@ -1,9 +1,9 @@
 use axum::{Router, extract::Query, routing::get};
+use serde::{Deserialize, Serialize};
 use serial_test::serial;
 use std::process::Output;
 use std::{collections::HashMap, time::Duration};
 use tokio::process::Command;
-use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ScaleResponse {
@@ -106,26 +106,30 @@ async fn get_pods() -> GetPodsResponse {
 
     if let Some(items) = parsed.get("items").and_then(|i| i.as_array()) {
         for item in items {
-            let name = item.get("metadata")
+            let name = item
+                .get("metadata")
                 .and_then(|m| m.get("name"))
                 .and_then(|n| n.as_str())
                 .unwrap_or("")
                 .to_string();
 
-            let ip_address = item.get("status")
+            let ip_address = item
+                .get("status")
                 .and_then(|s| s.get("podIP"))
                 .and_then(|ip| ip.as_str())
                 .unwrap_or("")
                 .to_string();
 
-            let is_canary = item.get("metadata")
+            let is_canary = item
+                .get("metadata")
                 .and_then(|m| m.get("labels"))
                 .and_then(|l| l.get("type"))
                 .and_then(|t| t.as_str())
                 .map(|t| t == "canary")
                 .unwrap_or(false);
 
-            let container_status = item.get("status")
+            let container_status = item
+                .get("status")
                 .and_then(|s| s.get("containerStatuses"))
                 .and_then(|c| c.as_array())
                 .and_then(|arr| arr.first());
@@ -141,18 +145,29 @@ async fn get_pods() -> GetPodsResponse {
                 .unwrap_or("")
                 .to_string();
 
-            let phase = item.get("status")
+            let is_terminating = item
+                .get("metadata")
+                .and_then(|m| m.get("deletionTimestamp"))
+                .is_some();
+
+            let phase = item
+                .get("status")
                 .and_then(|s| s.get("phase"))
                 .and_then(|p| p.as_str())
                 .unwrap_or("");
 
-            let status = match phase {
-                "Running" => PodStatus::Running,
-                "Pending" => PodStatus::Starting,
-                _ => PodStatus::Terminating,
+            let status = if is_terminating {
+                PodStatus::Terminating
+            } else {
+                match phase {
+                    "Running" => PodStatus::Running,
+                    "Pending" => PodStatus::Starting,
+                    _ => PodStatus::Terminating,
+                }
             };
 
-            let created_at = item.get("metadata")
+            let created_at = item
+                .get("metadata")
                 .and_then(|m| m.get("creationTimestamp"))
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
@@ -173,24 +188,23 @@ async fn get_pods() -> GetPodsResponse {
     GetPodsResponse { pods }
 }
 
-async fn rollout() {
-    run_k8_command("kubectl", &["rollout", "status", "deployment/captain"]).await;
-}
-
-async fn wait_for_pod_count(expected: usize) {
-        for _ in 0..30 { 
-            if get_active_pod_count().await == expected {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+async fn wait_for_active_pod_count(expected: usize) {
+    for _ in 0..30 {
+        if get_active_pod_count().await == expected {
+            return;
         }
-        panic!("Timed out waiting for pod count to reach {}", expected);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+    panic!("Timed out waiting for pod count to reach {}", expected);
+}
 
 async fn get_active_pod_count() -> usize {
     let get_pods_response = get_pods().await;
-    println!("{:#?}", get_pods_response.pods);
-    return get_pods_response.pods.iter().filter(|x| x.status == PodStatus::Running).count();
+    return get_pods_response
+        .pods
+        .iter()
+        .filter(|x| x.status == PodStatus::Running)
+        .count();
 }
 
 async fn run_k8_command(cmd: &str, args: &[&str]) -> Output {
@@ -230,6 +244,8 @@ mod tests {
             "Failed setup: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+
+        wait_for_active_pod_count(2).await;
     }
 
     async fn teardown() {
@@ -270,13 +286,12 @@ mod tests {
     async fn test_scale() {
         setup().await;
 
-        wait_for_pod_count(2).await;
         assert_eq!(get_active_pod_count().await, 2);
 
         let response = scale(ScaleRequest { replica_count: 4 }).await;
         assert!(response.success, "Scale failed: {:?}", response.failure_msg);
 
-        wait_for_pod_count(4).await;
+        wait_for_active_pod_count(4).await;
         assert_eq!(get_active_pod_count().await, 4);
 
         teardown().await;
@@ -287,12 +302,31 @@ mod tests {
     async fn test_restart() {
         setup().await;
 
+        let initial_pods = get_pods().await;
+        let initial_names: Vec<String> = initial_pods.pods.into_iter().map(|p| p.name).collect();
+
         let response = restart().await;
         assert!(
             response.success,
             "Restart failed: {:?}",
             response.failure_msg
         );
+
+        // Blocks until the rollout finishes.
+        // Don't use wait_for_pod_count(2) because the 2 old pods are still active.
+        run_k8_command("kubectl", &["rollout", "status", "deployment/captain"]).await;
+
+        let current_pods = get_pods().await;
+        for pod in current_pods.pods {
+            if pod.status == PodStatus::Terminating {
+                continue; // Ignore old pods that are still shutting down
+            }
+            assert!(
+                !initial_names.contains(&pod.name),
+                "Pod {} was not replaced during restart",
+                pod.name
+            );
+        }
 
         teardown().await;
     }
