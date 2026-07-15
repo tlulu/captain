@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serial_test::serial;
 use std::process::Output;
 use std::{collections::HashMap, time::Duration};
+use thiserror::Error;
 use tokio::process::Command;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -41,6 +42,28 @@ enum PodStatus {
     Running,
     Starting,
     Terminating,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct DeployCanaryRequest {
+    sha: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct DeployCanaryResponse {
+    success: bool,
+    failure_msg: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PromoteCanaryRequest {
+    sha: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PromoteCanaryResponse {
+    success: bool,
+    failure_msg: Option<String>,
 }
 
 async fn root() -> &'static str {
@@ -89,6 +112,98 @@ async fn restart() -> RestartResponse {
     }
 }
 
+#[derive(Error, Debug)]
+enum ManifestError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+async fn deploy_canary(request: DeployCanaryRequest) -> DeployCanaryResponse {
+    let manifest = "k8/deployment-canary.yaml";
+
+    if let Err(e) = update_manifest(&request.sha, manifest).await {
+        return DeployCanaryResponse {
+            success: false,
+            failure_msg: Some(e.to_string()),
+        };
+    }
+
+    // kubectl apply -f k8/deployment-canary.yaml
+    let output = run_k8_command("kubectl", &["apply", "-f", manifest]).await;
+
+    let success = output.status.success();
+    let failure_msg = if success {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&output.stderr).into_owned())
+    };
+
+    DeployCanaryResponse {
+        success,
+        failure_msg,
+    }
+}
+
+/**
+ * 1. Updates the deployment manifest with the new image
+ * 2. Rollout the new changes to existing pods
+ * 3. Delete the canary deployment
+ */
+async fn promote_canary(request: PromoteCanaryRequest) -> PromoteCanaryResponse {
+    let manifest = "k8/deployment.yaml";
+    let canary_manifest = "k8/deployment-canary.yaml";
+
+    if let Err(e) = update_manifest(&request.sha, manifest).await {
+        return PromoteCanaryResponse {
+            success: false,
+            failure_msg: Some(e.to_string()),
+        };
+    }
+
+    // kubectl apply -f k8/deployment.yaml
+    let output = run_k8_command("kubectl", &["apply", "-f", manifest]).await;
+
+    if !output.status.success() {
+        return PromoteCanaryResponse {
+            success: false,
+            failure_msg: Some(String::from_utf8_lossy(&output.stderr).into_owned()),
+        };
+    }
+
+    suspend_until_rollout_completes("deployment/captain").await;
+
+    let output = run_k8_command("kubectl", &["delete", "-f", canary_manifest]).await;
+    let success = output.status.success();
+    let failure_msg = if success {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&output.stderr).into_owned())
+    };
+
+    PromoteCanaryResponse {
+        success,
+        failure_msg,
+    }
+}
+
+async fn update_manifest(image: &str, manifest_path: &str) -> Result<(), ManifestError> {
+    let content = tokio::fs::read_to_string(manifest_path).await?;
+
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    for line in lines.iter_mut() {
+        if line.trim().starts_with("image:") {
+            let indent = line.len() - line.trim_start().len();
+            let spaces = &line[..indent];
+            *line = format!("{}image: {}", spaces, image);
+            break;
+        }
+    }
+    let new_content = lines.join("\n");
+
+    tokio::fs::write(manifest_path, new_content).await?;
+    Ok(())
+}
+
 async fn get_pods() -> GetPodsResponse {
     // kubectl get pods -o json
     let output = run_k8_command("kubectl", &["get", "pods", "-o", "json"]).await;
@@ -123,7 +238,7 @@ async fn get_pods() -> GetPodsResponse {
             let is_canary = item
                 .get("metadata")
                 .and_then(|m| m.get("labels"))
-                .and_then(|l| l.get("type"))
+                .and_then(|l| l.get("version"))
                 .and_then(|t| t.as_str())
                 .map(|t| t == "canary")
                 .unwrap_or(false);
@@ -205,6 +320,10 @@ async fn get_active_pod_count() -> usize {
         .iter()
         .filter(|x| x.status == PodStatus::Running)
         .count();
+}
+
+async fn suspend_until_rollout_completes(deployment_name: &str) {
+    run_k8_command("kubectl", &["rollout", "status", deployment_name]).await;
 }
 
 async fn run_k8_command(cmd: &str, args: &[&str]) -> Output {
@@ -312,9 +431,8 @@ mod tests {
             response.failure_msg
         );
 
-        // Blocks until the rollout finishes.
         // Don't use wait_for_pod_count(2) because the 2 old pods are still active.
-        run_k8_command("kubectl", &["rollout", "status", "deployment/captain"]).await;
+        suspend_until_rollout_completes("deployment/captain").await;
 
         let current_pods = get_pods().await;
         for pod in current_pods.pods {
@@ -328,6 +446,80 @@ mod tests {
             );
         }
 
+        teardown().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn canary_test() {
+        setup().await;
+        let current_image = "docker.io/library/captain:2.0";
+        let new_image = "docker.io/library/captain:3.0";
+        let _ = update_manifest(current_image, "k8/deployment-canary.yaml").await;
+
+        let pods: Vec<PodInfo> = get_pods()
+            .await
+            .pods
+            .into_iter()
+            .filter(|p| p.status == PodStatus::Running)
+            .collect();
+        for p in pods {
+            assert_eq!(p.image, current_image);
+        }
+
+        let response = deploy_canary(DeployCanaryRequest {
+            sha: new_image.to_string(),
+        })
+        .await;
+        assert!(
+            response.success,
+            "canary deploy failed: {:?}",
+            response.failure_msg
+        );
+
+        suspend_until_rollout_completes("deployment/captain-canary").await;
+
+        let canary: PodInfo = get_pods()
+            .await
+            .pods
+            .into_iter()
+            .find(|p| p.is_canary)
+            .expect("Expected canary pod to be running");
+
+        assert!(canary.name.contains("captain-canary"));
+        assert_eq!(canary.image, new_image);
+
+        let response = promote_canary(PromoteCanaryRequest {
+            sha: new_image.to_string(),
+        })
+        .await;
+        assert!(
+            response.success,
+            "promote failed: {:?}",
+            response.failure_msg
+        );
+
+        suspend_until_rollout_completes("deployment/captain").await;
+
+        let canary: Option<PodInfo> = get_pods()
+            .await
+            .pods
+            .into_iter()
+            .filter(|p| p.status == PodStatus::Running)
+            .find(|p| p.is_canary);
+        assert!(canary.is_none());
+
+        let pods: Vec<PodInfo> = get_pods()
+            .await
+            .pods
+            .into_iter()
+            .filter(|p| p.status == PodStatus::Running)
+            .collect();
+        for p in pods {
+            assert_eq!(p.image, new_image);
+        }
+
+        let _ = update_manifest(current_image, "k8/deployment.yaml").await;
         teardown().await;
     }
 }

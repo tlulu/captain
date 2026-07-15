@@ -1,22 +1,25 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: captain
+  name: captain-canary 
   labels:
     app: captain
+    version: canary
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: captain
+      version: canary
   template:
     metadata:
       labels:
         app: captain
+        version: canary
     spec:
       containers:
         - name: captain
-          image: docker.io/library/captain:2.0
+          image: docker.io/library/captain:3.0
           imagePullPolicy: Never
           ports:
             - containerPort: 3000
