@@ -1,32 +1,42 @@
-use axum::{Router, extract::Query, routing::get};
+use axum::{
+    Json, Router,
+    extract::Query,
+    routing::{get, post},
+};
 use serde::{Deserialize, Serialize};
 use serial_test::serial;
 use std::process::Output;
 use std::{collections::HashMap, time::Duration};
 use thiserror::Error;
 use tokio::process::Command;
+use ts_rs::TS;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, TS)]
+#[ts(export)]
 struct ScaleResponse {
     success: bool,
     failure_msg: Option<String>,
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, TS)]
+#[ts(export)]
 struct ScaleRequest {
     replica_count: u32,
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, TS)]
+#[ts(export)]
 struct RestartResponse {
     success: bool,
     failure_msg: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, TS)]
+#[ts(export)]
 struct GetPodsResponse {
     pods: Vec<PodInfo>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, TS)]
+#[ts(export)]
 struct PodInfo {
     name: String,
     ip_address: String,
@@ -37,30 +47,35 @@ struct PodInfo {
     status: PodStatus,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, TS)]
+#[ts(export)]
 enum PodStatus {
     Running,
     Starting,
     Terminating,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, TS)]
+#[ts(export)]
 struct DeployCanaryRequest {
     sha: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, TS)]
+#[ts(export)]
 struct DeployCanaryResponse {
     success: bool,
     failure_msg: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, TS)]
+#[ts(export)]
 struct PromoteCanaryRequest {
     sha: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, TS)]
+#[ts(export)]
 struct PromoteCanaryResponse {
     success: bool,
     failure_msg: Option<String>,
@@ -78,6 +93,13 @@ async fn test(Query(params): Query<HashMap<String, String>>) -> String {
 }
 
 async fn scale(request: ScaleRequest) -> ScaleResponse {
+    if let Err(e) = update_replicas(request.replica_count, "k8/deployment.yaml").await {
+        return ScaleResponse {
+            success: false,
+            failure_msg: Some(e.to_string()),
+        };
+    }
+
     // kubectl scale deployment/captain --replicas=5
     let replicas = format!("--replicas={}", request.replica_count);
     let output = run_k8_command("kubectl", &["scale", "deployment/captain", &replicas]).await;
@@ -194,7 +216,25 @@ async fn update_manifest(image: &str, manifest_path: &str) -> Result<(), Manifes
         if line.trim().starts_with("image:") {
             let indent = line.len() - line.trim_start().len();
             let spaces = &line[..indent];
-            *line = format!("{}image: {}", spaces, image);
+            *line = format!("{}image: {}", spaces, image.trim_matches('"'));
+            break;
+        }
+    }
+    let new_content = lines.join("\n");
+
+    tokio::fs::write(manifest_path, new_content).await?;
+    Ok(())
+}
+
+async fn update_replicas(count: u32, manifest_path: &str) -> Result<(), ManifestError> {
+    let content = tokio::fs::read_to_string(manifest_path).await?;
+
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    for line in lines.iter_mut() {
+        if line.trim().starts_with("replicas:") {
+            let indent = line.len() - line.trim_start().len();
+            let spaces = &line[..indent];
+            *line = format!("{}replicas: {}", spaces, count);
             break;
         }
     }
@@ -334,10 +374,39 @@ async fn run_k8_command(cmd: &str, args: &[&str]) -> Output {
         .expect("failed to execute process");
 }
 
+async fn get_pods_handler() -> Json<GetPodsResponse> {
+    Json(get_pods().await)
+}
+
+async fn scale_handler(Json(payload): Json<ScaleRequest>) -> Json<ScaleResponse> {
+    Json(scale(payload).await)
+}
+
+async fn restart_handler() -> Json<RestartResponse> {
+    Json(restart().await)
+}
+
+async fn deploy_canary_handler(
+    Json(payload): Json<DeployCanaryRequest>,
+) -> Json<DeployCanaryResponse> {
+    Json(deploy_canary(payload).await)
+}
+
+async fn promote_canary_handler(
+    Json(payload): Json<PromoteCanaryRequest>,
+) -> Json<PromoteCanaryResponse> {
+    Json(promote_canary(payload).await)
+}
+
 fn app() -> Router {
     Router::new()
         .route("/", get(root))
         .route("/test", get(test))
+        .route("/api/pods", get(get_pods_handler))
+        .route("/api/scale", post(scale_handler))
+        .route("/api/restart", post(restart_handler))
+        .route("/api/deploy_canary", post(deploy_canary_handler))
+        .route("/api/promote_canary", post(promote_canary_handler))
 }
 
 #[tokio::main]

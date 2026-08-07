@@ -10,7 +10,5 @@ spec:
     - name: http
       port: 80
       targetPort: 3000
-      # Optional field
-      # By default and for convenience, the Kubernetes control plane
-      # will allocate a port from a range (default: 30000-32767)
+      # Setting nodePort for local dev.
       nodePort: 30007
