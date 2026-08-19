@@ -28,7 +28,7 @@ function App() {
 
   useEffect(() => {
     fetchPodStatus();
-    const intervalId = setInterval(fetchPodStatus, 2000);
+    const intervalId = setInterval(fetchPodStatus, 500);
     return () => clearInterval(intervalId);
   }, []);
 
